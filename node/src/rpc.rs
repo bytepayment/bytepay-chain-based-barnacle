@@ -32,24 +32,28 @@
 
 use std::sync::Arc;
 
-use appchain_barnacle_runtime::{opaque::Block, AccountId, Balance, BlockNumber, Hash, Index};
-use sc_client_api::AuxStore;
-use sc_consensus_babe::{Config, Epoch};
-use sc_consensus_babe_rpc::BabeRpcHandler;
-use sc_consensus_epochs::SharedEpochChanges;
-use sc_finality_grandpa::{
-	FinalityProofProvider, GrandpaJustificationStream, SharedAuthoritySet, SharedVoterState,
+use fc_rpc::{
+	EthBlockDataCache, OverrideHandle, RuntimeApiStorageOverride, SchemaV1Override, StorageOverride,
 };
-use sc_finality_grandpa_rpc::GrandpaRpcHandler;
+use fc_rpc_core::types::FilterPool;
+use appchain_barnacle_runtime::{opaque::Block, AccountId, Balance, Hash, Index};
+use jsonrpc_pubsub::manager::SubscriptionManager;
+use pallet_ethereum::EthereumStorageSchema;
+use sc_client_api::{
+	backend::{AuxStore, Backend, StateBackend, StorageProvider},
+	client::BlockchainEvents,
+};
+use sc_consensus_manual_seal::rpc::{ManualSeal, ManualSealApi};
+use sc_network::NetworkService;
 use sc_rpc::SubscriptionTaskExecutor;
-pub use sc_rpc_api::DenyUnsafe;
-use sc_transaction_pool_api::TransactionPool;
+use sc_rpc_api::DenyUnsafe;
+use sc_service::TransactionPool;
+use sc_transaction_pool::{ChainApi, Pool};
 use sp_api::ProvideRuntimeApi;
 use sp_block_builder::BlockBuilder;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
-use sp_consensus::SelectChain;
-use sp_consensus_babe::BabeApi;
-use sp_keystore::SyncCryptoStorePtr;
+use sp_runtime::traits::BlakeTwo256;
+use std::collections::BTreeMap;
 
 /// Light client extra dependencies.
 pub struct LightDeps<C, F, P> {
@@ -63,140 +67,161 @@ pub struct LightDeps<C, F, P> {
 	pub fetcher: Arc<F>,
 }
 
-/// Extra dependencies for BABE.
-pub struct BabeDeps {
-	/// BABE protocol config.
-	pub babe_config: Config,
-	/// BABE pending epoch changes.
-	pub shared_epoch_changes: SharedEpochChanges<Block, Epoch>,
-	/// The keystore that manages the keys of the node.
-	pub keystore: SyncCryptoStorePtr,
-}
-
-/// Extra dependencies for GRANDPA
-pub struct GrandpaDeps<B> {
-	/// Voting round info.
-	pub shared_voter_state: SharedVoterState,
-	/// Authority set info.
-	pub shared_authority_set: SharedAuthoritySet<Hash, BlockNumber>,
-	/// Receives notifications about justification events from Grandpa.
-	pub justification_stream: GrandpaJustificationStream<Block>,
-	/// Executor to drive the subscription manager in the Grandpa RPC handler.
-	pub subscription_executor: SubscriptionTaskExecutor,
-	/// Finality proof provider.
-	pub finality_provider: Arc<FinalityProofProvider<B, Block>>,
-}
-
-/// Dependencies for BEEFY
-pub struct BeefyDeps {
-	/// Receives notifications about signed commitment events from BEEFY.
-	pub beefy_commitment_stream: beefy_gadget::notification::BeefySignedCommitmentStream<Block>,
-	/// Executor to drive the subscription manager in the BEEFY RPC handler.
-	pub subscription_executor: sc_rpc::SubscriptionTaskExecutor,
-}
-
 /// Full client dependencies.
-pub struct FullDeps<C, P, SC, B> {
+pub struct FullDeps<C, P, A: ChainApi> {
 	/// The client instance to use.
 	pub client: Arc<C>,
 	/// Transaction pool instance.
 	pub pool: Arc<P>,
-	/// The SelectChain Strategy
-	pub select_chain: SC,
-	/// A copy of the chain spec.
-	pub chain_spec: Box<dyn sc_chain_spec::ChainSpec>,
+	/// Graph pool instance.
+	pub graph: Arc<Pool<A>>,
 	/// Whether to deny unsafe calls
 	pub deny_unsafe: DenyUnsafe,
-	/// BABE specific dependencies.
-	pub babe: BabeDeps,
-	/// GRANDPA specific dependencies.
-	pub grandpa: GrandpaDeps<B>,
-	/// BEEFY specific dependencies.
-	pub beefy: BeefyDeps,
+	/// The Node authority flag
+	pub is_authority: bool,
+	/// Whether to enable dev signer
+	pub enable_dev_signer: bool,
+	/// Network service
+	pub network: Arc<NetworkService<Block, Hash>>,
+	/// EthFilterApi pool.
+	pub filter_pool: Option<FilterPool>,
+	/// Backend.
+	pub backend: Arc<fc_db::Backend<Block>>,
+	/// Maximum number of logs in a query.
+	pub max_past_logs: u32,
+	/// Manual seal command sink
+	pub command_sink:
+		Option<futures::channel::mpsc::Sender<sc_consensus_manual_seal::rpc::EngineCommand<Hash>>>,
 }
 
-/// A IO handler that uses all Full RPC extensions.
-pub type IoHandler = jsonrpc_core::IoHandler<sc_rpc::Metadata>;
-
 /// Instantiate all Full RPC extensions.
-pub fn create_full<C, P, SC, B>(
-	deps: FullDeps<C, P, SC, B>,
-) -> Result<jsonrpc_core::IoHandler<sc_rpc_api::Metadata>, Box<dyn std::error::Error + Send + Sync>>
+pub fn create_full<C, P, BE, A>(
+	deps: FullDeps<C, P, A>,
+	subscription_task_executor: SubscriptionTaskExecutor,
+) -> jsonrpc_core::IoHandler<sc_rpc::Metadata>
 where
-	C: ProvideRuntimeApi<Block>
-		+ HeaderBackend<Block>
-		+ AuxStore
-		+ HeaderMetadata<Block, Error = BlockChainError>
-		+ Sync
-		+ Send
-		+ 'static,
+	BE: Backend<Block> + 'static,
+	BE::State: StateBackend<BlakeTwo256>,
+	C: ProvideRuntimeApi<Block> + StorageProvider<Block, BE> + AuxStore,
+	C: BlockchainEvents<Block>,
+	C: HeaderBackend<Block> + HeaderMetadata<Block, Error = BlockChainError>,
+	C: Send + Sync + 'static,
 	C::Api: substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Index>,
-	C::Api: pallet_mmr_rpc::MmrRuntimeApi<Block, <Block as sp_runtime::traits::Block>::Hash>,
-	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
-	C::Api: BabeApi<Block>,
 	C::Api: BlockBuilder<Block>,
-	P: TransactionPool + 'static,
-	SC: SelectChain<Block> + 'static,
-	B: sc_client_api::Backend<Block> + Send + Sync + 'static,
-	B::State: sc_client_api::backend::StateBackend<sp_runtime::traits::HashFor<Block>>,
+	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
+	C::Api: fp_rpc::EthereumRuntimeRPCApi<Block>,
+	P: TransactionPool<Block = Block> + 'static,
+	A: ChainApi<Block = Block> + 'static,
 {
-	use pallet_mmr_rpc::{Mmr, MmrApi};
+	use fc_rpc::{
+		EthApi, EthApiServer, EthDevSigner, EthFilterApi, EthFilterApiServer, EthPubSubApi,
+		EthPubSubApiServer, EthSigner, HexEncodedIdProvider, NetApi, NetApiServer, Web3Api,
+		Web3ApiServer,
+	};
 	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
 	use substrate_frame_rpc_system::{FullSystem, SystemApi};
 
 	let mut io = jsonrpc_core::IoHandler::default();
-	let FullDeps { client, pool, select_chain, chain_spec, deny_unsafe, babe, grandpa, beefy } =
-		deps;
+	let FullDeps {
+		client,
+		pool,
+		graph,
+		deny_unsafe,
+		is_authority,
+		network,
+		filter_pool,
+		command_sink,
+		backend,
+		max_past_logs,
+		enable_dev_signer,
+	} = deps;
 
-	let BabeDeps { keystore, babe_config, shared_epoch_changes } = babe;
-	let GrandpaDeps {
-		shared_voter_state,
-		shared_authority_set,
-		justification_stream,
-		subscription_executor,
-		finality_provider,
-	} = grandpa;
-
-	io.extend_with(SystemApi::to_delegate(FullSystem::new(client.clone(), pool, deny_unsafe)));
-	// Making synchronous calls in light client freezes the browser currently,
-	// more context: https://github.com/paritytech/substrate/pull/3480
-	// These RPCs should use an asynchronous caller instead.
-	io.extend_with(MmrApi::to_delegate(Mmr::new(client.clone())));
-	io.extend_with(TransactionPaymentApi::to_delegate(TransactionPayment::new(client.clone())));
-	io.extend_with(sc_consensus_babe_rpc::BabeApi::to_delegate(BabeRpcHandler::new(
+	io.extend_with(SystemApi::to_delegate(FullSystem::new(
 		client.clone(),
-		shared_epoch_changes.clone(),
-		keystore,
-		babe_config,
-		select_chain,
+		pool.clone(),
 		deny_unsafe,
 	)));
-	io.extend_with(sc_finality_grandpa_rpc::GrandpaApi::to_delegate(GrandpaRpcHandler::new(
-		shared_authority_set.clone(),
-		shared_voter_state,
-		justification_stream,
-		subscription_executor,
-		finality_provider,
+	io.extend_with(TransactionPaymentApi::to_delegate(TransactionPayment::new(
+		client.clone(),
 	)));
 
-	io.extend_with(sc_sync_state_rpc::SyncStateRpcApi::to_delegate(
-		sc_sync_state_rpc::SyncStateRpcHandler::new(
-			chain_spec,
-			client,
-			shared_authority_set,
-			shared_epoch_changes,
-			deny_unsafe,
-		)?,
-	));
+	let mut signers = Vec::new();
+	if enable_dev_signer {
+		signers.push(Box::new(EthDevSigner::new()) as Box<dyn EthSigner>);
+	}
+	let mut overrides_map = BTreeMap::new();
+	overrides_map.insert(
+		EthereumStorageSchema::V1,
+		Box::new(SchemaV1Override::new(client.clone()))
+			as Box<dyn StorageOverride<_> + Send + Sync>,
+	);
 
-	io.extend_with(beefy_gadget_rpc::BeefyApi::to_delegate(
-		beefy_gadget_rpc::BeefyRpcHandler::new(
-			beefy.beefy_commitment_stream,
-			beefy.subscription_executor,
+	let overrides = Arc::new(OverrideHandle {
+		schemas: overrides_map,
+		fallback: Box::new(RuntimeApiStorageOverride::new(client.clone())),
+	});
+
+	let block_data_cache = Arc::new(EthBlockDataCache::new(50, 50));
+
+	io.extend_with(EthApiServer::to_delegate(EthApi::new(
+		client.clone(),
+		pool.clone(),
+		graph,
+		appchain_barnacle_runtime::TransactionConverter,
+		network.clone(),
+		signers,
+		overrides.clone(),
+		backend.clone(),
+		is_authority,
+		max_past_logs,
+		block_data_cache.clone(),
+		fc_rpc::format::Legacy,
+	)));
+
+	if let Some(filter_pool) = filter_pool {
+		io.extend_with(EthFilterApiServer::to_delegate(EthFilterApi::new(
+			client.clone(),
+			backend,
+			filter_pool.clone(),
+			500 as usize, // max stored filters
+			overrides.clone(),
+			max_past_logs,
+			block_data_cache.clone(),
+		)));
+	}
+
+	io.extend_with(NetApiServer::to_delegate(NetApi::new(
+		client.clone(),
+		network.clone(),
+		// Whether to format the `peer_count` response as Hex (default) or not.
+		true,
+	)));
+
+	io.extend_with(Web3ApiServer::to_delegate(Web3Api::new(client.clone())));
+
+	io.extend_with(EthPubSubApiServer::to_delegate(EthPubSubApi::new(
+		pool.clone(),
+		client.clone(),
+		network.clone(),
+		SubscriptionManager::<HexEncodedIdProvider>::with_id_provider(
+			HexEncodedIdProvider::default(),
+			Arc::new(subscription_task_executor),
 		),
-	));
+		overrides,
+	)));
 
-	Ok(io)
+	match command_sink {
+		Some(command_sink) => {
+			io.extend_with(
+				// We provide the rpc handler with the sending end of the channel to allow the rpc
+				// send EngineCommands to the background block authorship task.
+				ManualSealApi::to_delegate(ManualSeal::new(command_sink)),
+			);
+		}
+		_ => {}
+	}
+
+	io
 }
 
 /// Instantiate all Light RPC extensions.
@@ -210,14 +235,16 @@ where
 {
 	use substrate_frame_rpc_system::{LightSystem, SystemApi};
 
-	let LightDeps { client, pool, remote_blockchain, fetcher } = deps;
-	let mut io = jsonrpc_core::IoHandler::default();
-	io.extend_with(SystemApi::<Hash, AccountId, Index>::to_delegate(LightSystem::new(
+	let LightDeps {
 		client,
+		pool,
 		remote_blockchain,
 		fetcher,
-		pool,
-	)));
+	} = deps;
+	let mut io = jsonrpc_core::IoHandler::default();
+	io.extend_with(SystemApi::<Hash, AccountId, Index>::to_delegate(
+		LightSystem::new(client, remote_blockchain, fetcher, pool),
+	));
 
 	io
 }

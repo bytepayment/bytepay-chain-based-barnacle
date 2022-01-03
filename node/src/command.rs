@@ -1,7 +1,7 @@
 use crate::{
 	chain_spec,
 	cli::{Cli, Subcommand},
-	service,
+	service::{self, frontier_database_dir},
 };
 use appchain_barnacle_runtime::Block;
 use sc_cli::{ChainSpec, Role, RuntimeVersion, SubstrateCli};
@@ -36,7 +36,7 @@ impl SubstrateCli for Cli {
 		Ok(match id {
 			"dev" => Box::new(chain_spec::development_config()?),
 			"" | "local" => Box::new(chain_spec::local_testnet_config()?),
-			"octopus-testnet" => Box::new(chain_spec::octopus_testnet_config()?),
+			//"octopus-testnet" => Box::new(chain_spec::octopus_testnet_config()?),
 			path =>
 				Box::new(chain_spec::ChainSpec::from_json_file(std::path::PathBuf::from(path))?),
 		})
@@ -60,42 +60,70 @@ pub fn run() -> sc_cli::Result<()> {
 		Some(Subcommand::CheckBlock(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, import_queue, .. } =
-					service::new_partial(&config)?;
+				let PartialComponents {
+					client, 
+					task_manager, 
+					import_queue, 
+					.. 
+				} = service::new_partial(&config, &cli)?;
 				Ok((cmd.run(client, import_queue), task_manager))
 			})
 		},
 		Some(Subcommand::ExportBlocks(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, .. } = service::new_partial(&config)?;
+				let PartialComponents {
+					client,
+					task_manager,
+					..
+				} = service::new_partial(&config, &cli)?;
 				Ok((cmd.run(client, config.database), task_manager))
 			})
 		},
 		Some(Subcommand::ExportState(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, .. } = service::new_partial(&config)?;
+				let PartialComponents {
+					client,
+					task_manager,
+					..
+				} = service::new_partial(&config, &cli)?;
 				Ok((cmd.run(client, config.chain_spec), task_manager))
 			})
 		},
 		Some(Subcommand::ImportBlocks(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, import_queue, .. } =
-					service::new_partial(&config)?;
+				let PartialComponents {
+					client,
+					task_manager,
+					import_queue,
+					..
+				} = service::new_partial(&config, &cli)?;
 				Ok((cmd.run(client, import_queue), task_manager))
 			})
 		},
 		Some(Subcommand::PurgeChain(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
-			runner.sync_run(|config| cmd.run(config.database))
+			runner.sync_run(|config| {
+				// Remove Frontier offchain db
+				let frontier_database_config = sc_service::DatabaseSource::RocksDb {
+					path: frontier_database_dir(&config),
+					cache_size: 0,
+				};
+				cmd.run(frontier_database_config)?;
+				cmd.run(config.database)
+			})
 		},
 		Some(Subcommand::Revert(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, backend, .. } =
-					service::new_partial(&config)?;
+				let PartialComponents {
+					client,
+					task_manager,
+					backend,
+					..
+				} = service::new_partial(&config, &cli)?;
 				Ok((cmd.run(client, backend), task_manager))
 			})
 		},
@@ -110,11 +138,11 @@ pub fn run() -> sc_cli::Result<()> {
 					.into())
 			},
 		None => {
-			let runner = cli.create_runner(&cli.run)?;
+			let runner = cli.create_runner(&cli.run.base)?;
 			runner.run_node_until_exit(|config| async move {
 				match config.role {
 					Role::Light => service::new_light(config),
-					_ => service::new_full(config),
+					_ => service::new_full(config, &cli),
 				}
 				.map_err(sc_cli::Error::Service)
 			})
