@@ -1,5 +1,5 @@
 [package]
-authors = ['fanux <hi@oct.network>']
+authors = ['fanux <fhtjob@hotmail.com>']
 build = 'build.rs'
 description = 'a platform that supports paid tasks to complete open-source projects on Github.'
 edition = '2021'
