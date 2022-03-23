@@ -1,13 +1,13 @@
 [package]
-authors = ['Octopus Network <hi@oct.network>']
+authors = ['fanux <hi@oct.network>']
 build = 'build.rs'
-description = 'A minimal template for octopus appchain.'
+description = 'a platform that supports paid tasks to complete open-source projects on Github.'
 edition = '2021'
-homepage = 'https://oct.network/'
+homepage = 'https://bytepay.online/'
 license = 'Apache-2.0'
-name = 'appchain-barnacle'
+name = 'appchain-bytepay'
 publish = false
-repository = 'https://github.com/octopus-network/barnacle/'
+repository = 'https://github.com/bytepayment/bytepay-chain-based-barnacle/'
 version = '0.9.13'
 [package.metadata.docs.rs]
 targets = ['x86_64-unknown-linux-gnu']
@@ -20,7 +20,7 @@ runtime-benchmarks = ['appchain-barnacle-runtime/runtime-benchmarks']
 substrate-build-script-utils = { git = 'https://github.com/paritytech/substrate.git', branch = 'polkadot-v0.9.13' }
 
 [[bin]]
-name = 'appchain-barnacle'
+name = 'appchain-bytepay'
 
 [dependencies]
 jsonrpc-core = '18.0.0'
